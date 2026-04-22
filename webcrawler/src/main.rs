@@ -1,4 +1,4 @@
-/* * This file is part of the uutils coreutils package.
+/* 
 * I want to build a web crawler in rust, 
 * dependenceies I'll need tokio, reqwest, scraper, url 
 * web crawler process
@@ -13,13 +13,14 @@ use url::Url;
 use std::collections::VecDeque;
 
 
-//url lets us add relative urls to base urls
 
-#[tokio::main] //designates main as an async function 
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-    // set base url
-    let base_url = Url::parse("https://rogerhub.com/")?;
+//TODO: add error handling, respect robots.txt~, add delay between requests, limit crawl depth, handle dynamic content, add user-agent header, implement concurrency with tokio tasks. 
+//TODO: avoid revisiting urls 
+
+// collect urls can fail so we must update the function signature to return an error
+async fn collecturls(seed: &str) -> Result<Vec<String>, Box<dyn std::error::Error>>{
+    let base_url = Url::parse(seed)?;
 
     //grab body of the urlpage
     let body = reqwest::get(base_url.as_str())
@@ -39,42 +40,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       })
       .collect();
 
+      return Ok(links);
+}
+
+//url lets us add relative urls to base urls
+#[tokio::main] //designates main as an async function 
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
     let mut queue = VecDeque::new();
+    queue.push_back("https://books.toscrape.com/".to_string());
 
-
-    for link in links{
-        println!("{}", link);
-        queue.push_back(link)
-    }
     
-    while let Some(link) = queue.pop_front(){
-            // set base url
-        let base_url = Url::parse(&link)?;
-
-        //grab body of the urlpage
-        let body = reqwest::get(base_url.as_str())
-        .await? //wait for the page to respond
-        .text() //process information as text. 
-        .await?;
-
-        // list of links
-        let links: Vec<String> = Document::from(body.as_str())
-        .find(Name("a"))
-        .filter_map(|node| node.attr("href"))
-        .filter_map(|href| {
-            if href.starts_with('#') || href.is_empty(){
-                return None;
-            }
-            base_url.join(href).ok().map(|url| url.to_string())
-        })
-        .collect();
-        for link in links{
-        println!("{}", link);
-        queue.push_back(link)
-    }
-    
-
-
+    while let Some(links) = queue.pop_front(){
+        let new_links = collecturls(&links).await?;
+        for link in new_links{
+            println!("{}", link);
+            queue.push_back(link)
+        }
     }
 
     Ok(()) //this line means we executed the code without any errors
