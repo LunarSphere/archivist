@@ -21,13 +21,19 @@ async fn main() -> Result<()> {
     let requests_per_second: u32 = 10; // stay polite
     let num_workers: usize = 20; // concurrent tasks
     let max_pages: usize = 1000;
+    let depth_limit: usize = 3;
     let seed_urls = vec!["https://example.com"];
 
-    let state = Arc::new(CrawlerState::new(requests_per_second, max_pages));
+    let state = Arc::new(CrawlerState::new(
+        requests_per_second,
+        max_pages,
+        depth_limit,
+    ));
 
     //Create a bounded async-channel with a capacity of 10_000 URLs.
     //let (link_tx, link_rx) = async_channel::bounded(10_000);
-    let (link_tx, link_rx): (Sender<Url>, Receiver<Url>) = async_channel::bounded(10000);
+    let (link_tx, link_rx): (Sender<CrawlItem>, Receiver<CrawlItem>) =
+        async_channel::bounded(10000);
     let (db_tx, db_rx) = async_channel::bounded::<DbEvent>(10000);
     // `in_flight` counts URLs that have been queued but not yet
     // fully processed.  When it reaches 0, crawling is done.
@@ -46,13 +52,14 @@ async fn main() -> Result<()> {
     //Seed the crawl queue.
     for seed in seed_urls {
         let url = Url::parse(&seed)?;
+        let item = CrawlItem::new(url.clone(), 0);
         state.visited.insert(url.to_string());
         db_tx
             .send(DbEvent::PageQueued {
                 url: url.to_string(),
             })
             .await?;
-        link_tx.send(url).await?;
+        link_tx.send(item).await?;
         in_flight.fetch_add(1, Ordering::SeqCst);
     }
 

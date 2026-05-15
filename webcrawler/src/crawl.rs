@@ -15,6 +15,18 @@ use url::Url; // URL parsing
 
 use crate::arxiv_scrape::DbEvent;
 
+pub struct CrawlItem {
+    url: Url,
+    pub crawl_depth: usize,
+}
+impl CrawlItem {
+    pub fn new(url: Url, crawl_depth: usize) -> Self {
+        let url = url;
+        let crawl_depth = crawl_depth;
+        Self { url, crawl_depth }
+    }
+}
+
 //  CrawlerState holds everything that must be shared across
 //  all concurrent crawl tasks.  It is wrapped in an `Arc` so
 //  it can be cloned cheaply and sent to many tasks.
@@ -23,12 +35,13 @@ pub struct CrawlerState {
     pub visited: DashSet<String>,
     pub limiter: governor::DefaultDirectRateLimiter,
     pub max_pages: usize,
+    pub depth_limit: usize,
 }
 
 impl CrawlerState {
     /// `requests_per_second` — how many HTTP requests we are
     /// allowed to make every second across ALL tasks combined.
-    pub fn new(requests_per_second: u32, max_pages: usize) -> Self {
+    pub fn new(requests_per_second: u32, max_pages: usize, depth_limit: usize) -> Self {
         let client = Client::builder()
             .user_agent("Archivist/toySearchengine-1.0")
             .timeout(Duration::from_secs(10))
@@ -37,11 +50,13 @@ impl CrawlerState {
         let quota = Quota::per_second(NonZeroU32::new(requests_per_second).unwrap());
         let limiter = RateLimiter::direct(quota);
         let max_pages = max_pages;
+        let depth_limit = depth_limit;
         Self {
             client,
             visited: DashSet::new(),
             limiter,
             max_pages,
+            depth_limit,
         }
     }
 }
@@ -67,8 +82,8 @@ impl Drop for InFlightGuard {
 
 async fn crawl_page(
     state: Arc<CrawlerState>,
-    url: Url,
-    link_tx: Sender<Url>,
+    item: CrawlItem,
+    link_tx: Sender<CrawlItem>,
     db_tx: Sender<DbEvent>,
     in_flight: Arc<AtomicUsize>,
 ) -> Result<()> {
@@ -77,15 +92,15 @@ async fn crawl_page(
     state.limiter.until_ready().await;
 
     // Send the GET request and await the response.
-    let response = state.client.get(url.clone()).send().await?;
+    let response = state.client.get(item.url.clone()).send().await?;
 
     //check for failed urls and non text/html
     if !response.status().is_success() {
-        tracing::warn!(url = %url, status = %response.status(), "non-success status, skipping");
+        tracing::warn!(item.url = %item.url, status = %response.status(), "non-success status, skipping");
         //tell database the url failed
         let _ = db_tx
             .send(DbEvent::PageFailed {
-                url: url.to_string(),
+                url: item.url.to_string(),
                 error: format!("Http {}", response.status()),
             })
             .await;
@@ -106,7 +121,7 @@ async fn crawl_page(
     //TODO: we've gotten a repsonse so tell the db
     let _ = db_tx
         .send(DbEvent::PageFetched {
-            url: url.to_string(),
+            url: item.url.to_string(),
             http_status: response.status().as_u16(),
             content_type: content_type.to_string(),
         })
@@ -129,18 +144,22 @@ async fn crawl_page(
             }
 
             if let Some(href) = element.value().attr("href") {
-                if let Ok(absolute) = url.join(href) {
+                if let Ok(absolute) = item.url.join(href) {
                     if absolute.scheme() == "http" || absolute.scheme() == "https" {
+                        if item.crawl_depth + 1 > state.depth_limit {
+                            continue;
+                        }
                         let key = absolute.to_string();
                         if state.visited.insert(key.clone()) {
                             //TODO: tell the db the page was queued and the link was found
                             db_events.push(DbEvent::PageQueued { url: key.clone() });
                             db_events.push(DbEvent::LinkFound {
-                                from_url: url.to_string(),
+                                from_url: item.url.to_string(),
                                 to_url: key.clone(),
                             });
+                            let new_item = CrawlItem::new(absolute, item.crawl_depth + 1);
                             if state.visited.len() < state.max_pages {
-                                links.push(absolute);
+                                links.push(new_item);
                             }
                         }
                     }
@@ -154,12 +173,12 @@ async fn crawl_page(
         let _ = db_tx.send(event).await;
     }
     // Send all links to the channel.
-    for link in links {
+    for item in links {
         in_flight.fetch_add(1, Ordering::SeqCst);
-        let _ = link_tx.send(link).await;
+        let _ = link_tx.send(item).await;
     }
 
-    info!(url = %url, "crawled successfully");
+    info!(item.url = %item.url, "crawled successfully");
 
     // Mark this task as done.
     Ok(())
@@ -171,18 +190,18 @@ async fn crawl_page(
 
 pub async fn worker(
     state: Arc<CrawlerState>,
-    link_rx: Receiver<Url>,
-    link_tx: Sender<Url>,
+    link_rx: Receiver<CrawlItem>,
+    link_tx: Sender<CrawlItem>,
     db_tx: Sender<DbEvent>,
     in_flight: Arc<AtomicUsize>,
 ) {
-    while let Ok(link) = link_rx.recv().await {
+    while let Ok(item) = link_rx.recv().await {
         let state = Arc::clone(&state);
         let tx = link_tx.clone();
         let db_tx = db_tx.clone();
         let counter = Arc::clone(&in_flight);
 
-        let crawl_future = crawl_page(state, link, tx, db_tx, counter);
+        let crawl_future = crawl_page(state, item, tx, db_tx, counter);
         tokio::spawn(async move {
             if let Err(e) = crawl_future.await {
                 tracing::error!("crawl failed: {e}");
